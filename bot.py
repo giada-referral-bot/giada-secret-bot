@@ -2,7 +2,6 @@ import os
 import sqlite3
 import threading
 import asyncio
-from urllib.parse import quote
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -122,35 +121,34 @@ def referral_link(user_id):
     return f"https://t.me/GiadaSecretAccessBot?start=ref_{user_id}"
 
 
-def share_link(user_id):
-    link = referral_link(user_id)
-    text = (
-        "💋 Accedi a Giada: foto, video e contenuti esclusivi. "
-        "Entra qui per continuare 👇"
-    )
-    return (
-        "https://t.me/share/url?url="
-        + quote(link, safe="")
-        + "&text="
-        + quote(text, safe="")
-    )
-
-
-def invite_keyboard(user_id):
+def invite_keyboard(user_id, count):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💌 INVITA I MIEI AMICI", url=share_link(user_id))],
+        [InlineKeyboardButton(
+            f"💌 CONDIVIDI LINK {count}/3",
+            callback_data="invite_photo"
+        )],
+        [InlineKeyboardButton("🔄 VERIFICA", callback_data="verify")],
+    ])
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💋 INVITA CON FOTO", callback_data="invite_photo")],
+        [InlineKeyboardButton("🔗 CONDIVIDI LINK", url=share_link(user_id))],
         [InlineKeyboardButton("🔄 VERIFICA", callback_data="verify")],
     ])
 
 
 async def send_invitation_card(chat_id, context, user_id):
+    link = referral_link(user_id)
     text = (
-        "💋 <b>ACCEDI A GIADA</b> 🐷\n\n"
+        "💋 <b>GIADA SECRET</b> 🐷\n\n"
         "Ti aspettano <b>foto, video e contenuti esclusivi</b> di Giada.\n\n"
-        "🔐 Premi qui sotto per continuare."
+        "🔐 <b>Premi qui sotto per accedere.</b>"
     )
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💋 ACCEDI A GIADA", url=referral_link(user_id))
+        InlineKeyboardButton(
+            "💋 ACCEDI A GIADA",
+            url=link
+        )
     ]])
 
     with open(PHOTO_PATH, "rb") as photo:
@@ -202,7 +200,7 @@ async def send_main_access(chat_id, context, user_id):
             photo=InputFile(photo, filename="giada.jpg"),
             caption=text,
             parse_mode="HTML",
-            reply_markup=invite_keyboard(user_id),
+            reply_markup=invite_keyboard(user_id, count),
         )
 
 
@@ -286,6 +284,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "invite_photo":
+        await send_invitation_card(query.message.chat_id, context, query.from_user.id)
+        return
+
     await process_start(query.message.chat_id, query.from_user.id, context)
 
 
@@ -299,7 +302,7 @@ async def run_bot_async():
     application.add_handler(
         CallbackQueryHandler(
             verify,
-            pattern=r"^(verify|verify_channel)$",
+            pattern=r"^(verify|verify_channel|invite_photo)$",
         )
     )
     application.add_error_handler(error_handler)
