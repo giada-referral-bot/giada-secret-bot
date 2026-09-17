@@ -1,316 +1,325 @@
 import os
 import sqlite3
+import threading
 import asyncio
 from urllib.parse import quote
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "@Giadasecret")
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "GiadaSecretAccessBot")
 PRIVATE_INVITE_URL = os.environ["PRIVATE_INVITE_URL"]
-PUBLIC_CHANNEL_URL = os.environ.get("PUBLIC_CHANNEL_URL", "https://t.me/Giadasecret")
-PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
-if not PUBLIC_URL:
-    raise RuntimeError("Render public URL not available; set PUBLIC_URL in environment.")
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram")
-PORT = int(os.environ.get("PORT", "10000"))
 
-DB_PATH = Path(os.environ.get("DB_PATH", "referrals.db"))
+app = Flask(__name__)
+DB = "referrals.db"
+PHOTO_PATH = os.path.join(os.path.dirname(__file__), "giada.jpg")
+db_lock = threading.Lock()
 
-
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def init_db():
-    with db_connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                referrer_id INTEGER,
-                referrals INTEGER NOT NULL DEFAULT 0,
-                unlocked INTEGER NOT NULL DEFAULT 0,
-                referral_credited INTEGER NOT NULL DEFAULT 0
-            )
-            """
+conn = sqlite3.connect(DB, check_same_thread=False)
+with db_lock:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER,
+            referrals INTEGER NOT NULL DEFAULT 0,
+            unlocked INTEGER NOT NULL DEFAULT 0
         )
-        # Upgrade the DB if this file existed from an earlier version.
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
-        if "referral_credited" not in columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN referral_credited INTEGER NOT NULL DEFAULT 0"
-            )
-        conn.commit()
-
-
-init_db()
+    """)
+    conn.commit()
 
 
 def get_user(user_id):
-    with db_connect() as conn:
+    with db_lock:
         return conn.execute(
-            """
-            SELECT user_id, referrer_id, referrals, unlocked, referral_credited
-            FROM users WHERE user_id=?
-            """,
+            "SELECT user_id, referrer_id, referrals, unlocked FROM users WHERE user_id=?",
             (user_id,),
         ).fetchone()
 
 
-def upsert_user(user_id, referrer_id=None):
-    """Create a user, or attach a referral to an existing uncredited user."""
-    with db_connect() as conn:
+def ensure_user(user_id, referrer_id=None):
+    with db_lock:
         row = conn.execute(
-            "SELECT user_id, referrer_id, referrals, unlocked, referral_credited "
-            "FROM users WHERE user_id=?",
+            "SELECT user_id, referrer_id, referrals, unlocked FROM users WHERE user_id=?",
             (user_id,),
         ).fetchone()
 
-        if row is None:
-            if referrer_id == user_id:
-                referrer_id = None
-            if referrer_id is not None:
-                ref_exists = conn.execute(
-                    "SELECT 1 FROM users WHERE user_id=?", (referrer_id,)
-                ).fetchone()
-                if not ref_exists:
-                    referrer_id = None
-            conn.execute(
-                "INSERT INTO users(user_id, referrer_id) VALUES(?, ?)",
-                (user_id, referrer_id),
-            )
-            conn.commit()
-            return conn.execute(
-                "SELECT user_id, referrer_id, referrals, unlocked, referral_credited "
-                "FROM users WHERE user_id=?",
-                (user_id,),
-            ).fetchone()
+        if row:
+            return row
 
-        # A user who opened the bot without a referral can still later arrive via
-        # a valid referral link, as long as they have not already been credited.
-        if (
-            referrer_id is not None
-            and referrer_id != user_id
-            and row[1] is None
-            and row[4] == 0
-        ):
-            ref_exists = conn.execute(
-                "SELECT 1 FROM users WHERE user_id=?", (referrer_id,)
-            ).fetchone()
-            if ref_exists:
-                conn.execute(
-                    "UPDATE users SET referrer_id=? WHERE user_id=?",
-                    (referrer_id, user_id),
-                )
-                conn.commit()
+        if referrer_id == user_id:
+            referrer_id = None
 
-        return get_user(user_id)
+        conn.execute(
+            "INSERT INTO users(user_id, referrer_id) VALUES(?, ?)",
+            (user_id, referrer_id),
+        )
+        conn.commit()
+
+    return get_user(user_id)
 
 
 async def is_member(bot, user_id):
     try:
         member = await bot.get_chat_member(PUBLIC_CHANNEL, user_id)
-        return member.status in {"member", "administrator", "creator"}
+        return member.status in ("member", "administrator", "creator")
     except Exception as exc:
-        print(f"PUBLIC CHANNEL CHECK ERROR: {exc!r}")
+        print("MEMBERSHIP CHECK ERROR:", repr(exc))
         return False
 
 
-def credit_referral(referred_user_id):
-    """Credit one referred user once. Returns (referrer_id, count, credited)."""
-    with db_connect() as conn:
+def credit_referral(user_id):
+    """
+    Credit the user to the referrer exactly once.
+    The referrer_id is cleared after crediting so the same user
+    cannot be counted twice for the same inviter.
+    """
+    with db_lock:
         row = conn.execute(
-            "SELECT referrer_id, referral_credited FROM users WHERE user_id=?",
-            (referred_user_id,),
+            "SELECT referrer_id FROM users WHERE user_id=?",
+            (user_id,),
         ).fetchone()
-        if not row or not row[0] or row[1] == 1:
-            return None, 0, False
+
+        if not row or not row[0]:
+            return None, 0
 
         referrer_id = row[0]
-        ref_row = conn.execute(
-            "SELECT referrals, unlocked FROM users WHERE user_id=?",
-            (referrer_id,),
-        ).fetchone()
-        if not ref_row:
-            return None, 0, False
 
-        current_count = ref_row[0]
-        if current_count < 3:
-            conn.execute(
-                "UPDATE users SET referrals=referrals+1 WHERE user_id=?",
-                (referrer_id,),
-            )
-            current_count += 1
-            if current_count >= 3:
-                conn.execute(
-                    "UPDATE users SET unlocked=1 WHERE user_id=?",
-                    (referrer_id,),
-                )
-
-        # Mark the referred user as consumed so the same person can never count
-        # twice for another click/restart.
         conn.execute(
-            "UPDATE users SET referral_credited=1, referrer_id=NULL WHERE user_id=?",
-            (referred_user_id,),
+            """
+            UPDATE users
+            SET referrals = MIN(referrals + 1, 3),
+                referrer_id = NULL
+            WHERE user_id=?
+            """,
+            (referrer_id,),
+        )
+        conn.execute(
+            "UPDATE users SET referrer_id=NULL WHERE user_id=?",
+            (user_id,),
         )
         conn.commit()
-        return referrer_id, current_count, True
+
+        count = conn.execute(
+            "SELECT referrals FROM users WHERE user_id=?",
+            (referrer_id,),
+        ).fetchone()[0]
+
+    return referrer_id, count
+
+
+def unlock_user(user_id):
+    with db_lock:
+        conn.execute(
+            "UPDATE users SET unlocked=1 WHERE user_id=?",
+            (user_id,),
+        )
+        conn.commit()
 
 
 def referral_link(user_id):
-    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    return f"https://t.me/GiadaSecretAccessBot?start=ref_{user_id}"
 
 
-def referral_keyboard(user_id):
+def share_link(user_id):
     link = referral_link(user_id)
-    share_url = (
+    text = (
+        "💋 Accedi a Giada: foto, video e contenuti esclusivi. "
+        "Entra qui per continuare 👇"
+    )
+    return (
         "https://t.me/share/url?url="
         + quote(link, safe="")
         + "&text="
-        + quote("🐷 Accedi qui per continuare: ", safe="")
-    )
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📤 CONDIVIDI IL MIO LINK", url=share_url)],
-            [InlineKeyboardButton("🔄 VERIFICA", callback_data="verify")],
-        ]
+        + quote(text, safe="")
     )
 
 
-def join_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🐷 UNISCITI AL CANALE", url=PUBLIC_CHANNEL_URL)],
-            [InlineKeyboardButton("✅ VERIFICA ACCESSO", callback_data="verify")],
-        ]
+def invite_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💌 INVITA I MIEI AMICI", url=share_link(user_id))],
+        [InlineKeyboardButton("🔄 VERIFICA", callback_data="verify")],
+    ])
+
+
+async def send_invitation_card(chat_id, context, user_id):
+    text = (
+        "💋 <b>ACCEDI A GIADA</b> 🐷\n\n"
+        "Ti aspettano <b>foto, video e contenuti esclusivi</b> di Giada.\n\n"
+        "🔐 Premi qui sotto per continuare."
     )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💋 ACCEDI A GIADA", url=referral_link(user_id))
+    ]])
 
-
-def private_keyboard():
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔐 ACCEDI AL CANALE PRIVATO DI GIADA 🐷", url=PRIVATE_INVITE_URL)]]
-    )
-
-
-async def send_access_status(chat_id, user_id, context):
-    row = get_user(user_id) or upsert_user(user_id)
-
-    if not await is_member(context.bot, user_id):
-        await context.bot.send_message(
+    with open(PHOTO_PATH, "rb") as photo:
+        await context.bot.send_photo(
             chat_id=chat_id,
-            text=(
-                "🔒 ACCESSO NON ANCORA DISPONIBILE\n\n"
-                "Per continuare devi prima unirti al canale di accesso.\n\n"
-                "Dopo esserti unito, torna qui e premi «VERIFICA ACCESSO»."
-            ),
-            reply_markup=join_keyboard(),
+            photo=InputFile(photo, filename="giada.jpg"),
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
+
+
+async def send_access_gate(chat_id, context):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💋 UNISCITI AL CANALE", url="https://t.me/Giadasecret")],
+        [InlineKeyboardButton("🔄 VERIFICA ACCESSO", callback_data="verify_channel")],
+    ])
+    text = (
+        "🔒 <b>ACCESSO NON ANCORA DISPONIBILE</b>\n\n"
+        "Per continuare devi prima unirti al canale di accesso di Giada 🐷.\n\n"
+        "Dopo esserti unito, torna qui e premi <b>VERIFICA ACCESSO</b>."
+    )
+    with open(PHOTO_PATH, "rb") as photo:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(photo, filename="giada.jpg"),
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+
+async def send_main_access(chat_id, context, user_id):
+    row = get_user(user_id) or ensure_user(user_id)
+    count = row[2]
+
+    text = (
+        "🐷 <b>BENVENUTO/A</b>\n\n"
+        "Per ottenere l'accesso ai contenuti esclusivi di Giada, "
+        "completa la procedura.\n\n"
+        f"👥 <b>Inviti completati: {count}/3</b>\n\n"
+        "Invita 3 amici usando il pulsante qui sotto. "
+        "Ogni accesso verificato farà avanzare il tuo contatore."
+    )
+
+    with open(PHOTO_PATH, "rb") as photo:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(photo, filename="giada.jpg"),
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=invite_keyboard(user_id),
+        )
+
+
+async def process_start(chat_id, user_id, context):
+    row = get_user(user_id)
+    if not row:
+        row = ensure_user(user_id)
+
+    # The user must belong to the public access channel.
+    if not await is_member(context.bot, user_id):
+        await send_access_gate(chat_id, context)
         return
 
-    # If this user was brought in through another user's referral link, the
-    # referral becomes valid only now, after membership is verified.
-    row = get_user(user_id)
-    if row and row[1] and row[4] == 0:
-        referrer_id, count, credited = credit_referral(user_id)
-        if credited and referrer_id:
+    # A referral is credited only after the referred user has joined
+    # the public channel and started the bot.
+    if row[1]:
+        referrer_id, count = credit_referral(user_id)
+        if referrer_id:
             try:
                 if count >= 3:
+                    unlock_user(referrer_id)
                     await context.bot.send_message(
                         referrer_id,
-                        "🎉 HAI COMPLETATO 3/3!\n\nIl tuo accesso è stato sbloccato.",
-                        reply_markup=private_keyboard(),
+                        "🔥 <b>3/3 COMPLETATO</b>\n\n"
+                        "Il tuo accesso privato è stato sbloccato.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "🐷 ACCEDI AL CANALE PRIVATO",
+                                url=PRIVATE_INVITE_URL,
+                            )
+                        ]]),
                     )
                 else:
                     await context.bot.send_message(
                         referrer_id,
-                        f"✅ Nuovo accesso verificato!\n\n👥 Inviti completati: {count}/3",
+                        f"✅ <b>Nuovo accesso verificato</b>\n\n"
+                        f"👥 Inviti completati: {count}/3",
+                        parse_mode="HTML",
                     )
             except Exception as exc:
-                print(f"REFERRER MESSAGE ERROR: {exc!r}")
+                print("REFERRER MESSAGE ERROR:", repr(exc))
 
-    row = get_user(user_id)
-    if row and row[3]:
+    row = get_user(user_id) or ensure_user(user_id)
+
+    if row[3]:
         await context.bot.send_message(
-            chat_id=chat_id,
-            text="🔓 ACCESSO SBLOCCATO!\n\nPuoi entrare nel canale privato di Giada 🐷",
-            reply_markup=private_keyboard(),
+            chat_id,
+            "🔓 <b>ACCESSO SBLOCCATO</b>\n\n"
+            "Puoi entrare nel canale privato di Giada 🐷.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🐷 ACCEDI AL CANALE PRIVATO",
+                    url=PRIVATE_INVITE_URL,
+                )
+            ]]),
         )
         return
 
-    count = row[2] if row else 0
-    link = referral_link(user_id)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🐷 BENVENUTO!\n\n"
-            "L'accesso ai contenuti esclusivi è disponibile dopo aver completato la procedura.\n\n"
-            f"👥 Inviti completati: {count}/3\n\n"
-            "Il tuo link personale è:\n"
-            f"{link}\n\n"
-            "Condividilo con i tuoi amici. Per essere conteggiato, ogni invitato deve "
-            "entrare nel canale di accesso e confermare l'accesso qui."
-        ),
-        reply_markup=referral_keyboard(user_id),
-    )
+    await send_main_access(chat_id, context, user_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     referrer_id = None
-    if context.args:
-        value = context.args[0]
-        if value.startswith("ref_"):
-            try:
-                referrer_id = int(value[4:])
-            except ValueError:
-                referrer_id = None
 
-    upsert_user(user_id, referrer_id)
-    await send_access_status(update.effective_chat.id, user_id, context)
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            referrer_id = int(context.args[0][4:])
+        except ValueError:
+            referrer_id = None
+
+    row = get_user(user_id)
+    if not row:
+        ensure_user(user_id, referrer_id)
+
+    await process_start(update.effective_chat.id, user_id, context)
 
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await send_access_status(query.message.chat_id, query.from_user.id, context)
+    await process_start(query.message.chat_id, query.from_user.id, context)
 
 
 async def error_handler(update, context):
-    print(f"BOT ERROR: {context.error!r}")
+    print("BOT ERROR:", repr(context.error))
 
 
-def main():
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .build()
-    )
+async def run_bot_async():
+    application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(
-        CallbackQueryHandler(verify, pattern=r"^verify$")
+        CallbackQueryHandler(
+            verify,
+            pattern=r"^(verify|verify_channel)$",
+        )
     )
     application.add_error_handler(error_handler)
 
-    webhook_url = f"{PUBLIC_URL}/{WEBHOOK_PATH}"
-    print(f"Starting Giada Secret bot webhook at {webhook_url}")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await asyncio.Event().wait()
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+
+def run_bot():
+    asyncio.run(run_bot_async())
+
+
+@app.get("/")
+def health():
+    return "Giada Secret bot OK", 200
 
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_bot, daemon=True).start()
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
