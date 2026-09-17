@@ -11,8 +11,8 @@ Flow:
 
 Required Render environment variables:
 - BOT_TOKEN = the token from BotFather
-- PRIVATE_INVITE_URL = a permanent invite link to the private Giada channel
-- PUBLIC_URL = the Render service URL, e.g. https://giada-secret-bot.onrender.com
+- PRIVATE_INVITE_URL = the invite link to the private Giada channel
+- PUBLIC_URL is optional; on Render the code uses the built-in RENDER_EXTERNAL_URL automatically, e.g. https://giada-secret-bot.onrender.com
 
 Optional variables:
 - PUBLIC_CHANNEL = @Giadasecret
@@ -26,3 +26,5 @@ Important:
 - Never put BOT_TOKEN in GitHub.
 - The bot must be an administrator of @Giadasecret so getChatMember can verify membership.
 - The SQLite database on Render Free is ephemeral. It is suitable for testing, but referral data can be lost when the service restarts or spins down. Use persistent PostgreSQL for a production setup.
+
+Render Start Command: `python bot.py`.
