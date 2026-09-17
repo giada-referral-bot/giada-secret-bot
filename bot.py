@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import asyncio
+from urllib.parse import quote
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -161,11 +162,21 @@ def credit_referral(referred_user_id):
         return referrer_id, current_count, True
 
 
+def referral_link(user_id):
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+
 def referral_keyboard(user_id):
-    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    link = referral_link(user_id)
+    share_url = (
+        "https://t.me/share/url?url="
+        + quote(link, safe="")
+        + "&text="
+        + quote("🐷 Accedi qui per continuare: ", safe="")
+    )
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔗 INVITA AMICI", url=link)],
+            [InlineKeyboardButton("📤 CONDIVIDI IL MIO LINK", url=share_url)],
             [InlineKeyboardButton("🔄 VERIFICA", callback_data="verify")],
         ]
     )
@@ -232,15 +243,17 @@ async def send_access_status(chat_id, user_id, context):
         return
 
     count = row[2] if row else 0
+    link = referral_link(user_id)
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
             "🐷 BENVENUTO!\n\n"
             "L'accesso ai contenuti esclusivi è disponibile dopo aver completato la procedura.\n\n"
             f"👥 Inviti completati: {count}/3\n\n"
-            "Condividi il tuo link personale con i tuoi amici. "
-            "Per essere conteggiato, ogni invitato deve entrare nel canale di accesso "
-            "e confermare l'accesso qui."
+            "Il tuo link personale è:\n"
+            f"{link}\n\n"
+            "Condividilo con i tuoi amici. Per essere conteggiato, ogni invitato deve "
+            "entrare nel canale di accesso e confermare l'accesso qui."
         ),
         reply_markup=referral_keyboard(user_id),
     )
