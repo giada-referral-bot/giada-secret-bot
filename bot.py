@@ -139,17 +139,13 @@ def invite_keyboard(user_id, count):
 
 async def send_invitation_card(chat_id, context, user_id):
     link = referral_link(user_id)
+
+    # First message: Giada's photo with the invitation text.
     text = (
-        "💋 <b>GIADA SECRET</b> 🐷\n\n"
-        "Ti aspettano <b>foto, video e contenuti esclusivi</b> di Giada.\n\n"
-        "🔐 <b>Premi qui sotto per accedere.</b>"
+        "💋 <b>Accedi nell'Archivio Segreto di Giada</b> 🐷\n\n"
+        "Foto, video e contenuti esclusivi.\n"
+        "Entra qui per continuare 👇"
     )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "💋 ACCEDI A GIADA",
-            url=link
-        )
-    ]])
 
     with open(PHOTO_PATH, "rb") as photo:
         await context.bot.send_photo(
@@ -157,8 +153,15 @@ async def send_invitation_card(chat_id, context, user_id):
             photo=InputFile(photo, filename="giada.jpg"),
             caption=text,
             parse_mode="HTML",
-            reply_markup=keyboard,
         )
+
+    # Second message: the personal referral link is placed directly
+    # underneath the photo, exactly as a separate clickable Telegram link.
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=link,
+        disable_web_page_preview=False,
+    )
 
 
 async def send_access_gate(chat_id, context):
