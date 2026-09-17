@@ -10,7 +10,9 @@ PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "@Giadasecret")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "GiadaSecretAccessBot")
 PRIVATE_INVITE_URL = os.environ["PRIVATE_INVITE_URL"]
 PUBLIC_CHANNEL_URL = os.environ.get("PUBLIC_CHANNEL_URL", "https://t.me/Giadasecret")
-PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
+if not PUBLIC_URL:
+    raise RuntimeError("Render public URL not available; set PUBLIC_URL in environment.")
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram")
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -270,7 +272,14 @@ async def error_handler(update, context):
 
 
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(
         CallbackQueryHandler(verify, pattern=r"^verify$")
